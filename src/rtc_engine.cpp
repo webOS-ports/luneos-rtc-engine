@@ -703,6 +703,41 @@ static bool svcStop(LSHandle *sh, LSMessage *msg, void *)
     return true;
 }
 
+/* Camera presence, probed from droidcamsrc's camera-device property
+ * range at READY (the gst-droid notifier pattern): the platform may
+ * ship the whole video-call stack yet have no physical camera. */
+static int probeCameraCount(void)
+{
+    static int cached = -1;
+    if (cached >= 0)
+        return cached;
+    GstElement *cam = gst_element_factory_make("droidcamsrc", nullptr);
+    if (!cam)
+        return cached = 0;
+    int count = 0;
+    if (gst_element_set_state(cam, GST_STATE_READY) != GST_STATE_CHANGE_FAILURE)
+    {
+        GParamSpec *spec = g_object_class_find_property(
+            G_OBJECT_GET_CLASS(cam), "camera-device");
+        if (spec && G_IS_PARAM_SPEC_INT(spec))
+            count = G_PARAM_SPEC_INT(spec)->maximum + 1;
+        gst_element_set_state(cam, GST_STATE_NULL);
+    }
+    gst_object_unref(cam);
+    return cached = count;
+}
+
+static bool svcCapabilities(LSHandle *sh, LSMessage *msg, void *)
+{
+    int cameras  = probeCameraCount();
+    gchar *reply = g_strdup_printf(
+        "{\"returnValue\":true,\"cameraCount\":%d,\"videoCallCapable\":%s}",
+        cameras, cameras > 0 ? "true" : "false");
+    lsReply(sh, msg, reply);
+    g_free(reply);
+    return true;
+}
+
 static bool svcStatus(LSHandle *sh, LSMessage *msg, void *)
 {
     gchar *reply = g_strdup_printf(
@@ -718,6 +753,7 @@ static LSMethod serviceMethods[] = {
     {"start", svcStart, LUNA_METHOD_FLAGS_NONE},
     {"stop", svcStop, LUNA_METHOD_FLAGS_NONE},
     {"status", svcStatus, LUNA_METHOD_FLAGS_NONE},
+    {"capabilities", svcCapabilities, LUNA_METHOD_FLAGS_NONE},
     {nullptr, nullptr, LUNA_METHOD_FLAGS_NONE},
 };
 
