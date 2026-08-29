@@ -104,8 +104,20 @@ static const char *acquireCodecs(bool wantEnc, bool wantDec)
             rmc.reset();
             return "denied";
         }
+        /* release() takes the resources array, not the acquire response */
         acquiredResources = response;
-        g_print("uMS acquired: %s\n", response.c_str());
+        pbnjson::JDomParser parser;
+        if (parser.parse(response, pbnjson::JSchema::AllSchema()))
+        {
+            pbnjson::JValue resources = parser.getDom()["resources"];
+            std::string serialized;
+            pbnjson::JGenerator generator(nullptr);
+            if (resources.isArray() &&
+                generator.toString(resources, pbnjson::JSchema::AllSchema(),
+                                   serialized))
+                acquiredResources = serialized;
+        }
+        g_print("uMS acquired: %s\n", acquiredResources.c_str());
         return "acquired";
     }
     catch (const std::exception &e)
