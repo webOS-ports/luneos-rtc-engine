@@ -70,6 +70,28 @@ static GMainLoop *loop;
 static guint64 txAUs, txBytes, txKeyframes, rxAUs, rxFrames;
 static bool sessionRunning;
 
+/* IDR detection by NAL scan: the DELTA_UNIT buffer flag does not
+ * survive every element chain, but the bytes do not lie. */
+static bool auHasIdr(const guint8 *data, gsize size)
+{
+    for (gsize i = 0; i + 3 < size; i++)
+    {
+        if (data[i] != 0 || data[i + 1] != 0)
+            continue;
+        gsize nal = 0;
+        if (data[i + 2] == 1)
+            nal = i + 3;
+        else if (data[i + 2] == 0 && data[i + 3] == 1 && i + 4 < size)
+            nal = i + 4;
+        else
+            continue;
+        if ((data[nal] & 0x1f) == 5)
+            return true;
+        i = nal - 1;
+    }
+    return false;
+}
+
 /* ---------------- capture/codec backends ----------------
  *
  * The engine is backend-agnostic: on Halium devices the droidmedia stack
@@ -323,7 +345,7 @@ static GstFlowReturn txSampleCb(GstElement *sink, gpointer)
             gst_buffer_unref(copy);
             txAUs++;
             txBytes += map.size;
-            if (!GST_BUFFER_FLAG_IS_SET(buf, GST_BUFFER_FLAG_DELTA_UNIT))
+            if (auHasIdr(map.data, map.size))
                 txKeyframes++;
             rxAUs++;
         }
@@ -344,7 +366,7 @@ static GstFlowReturn txSampleCb(GstElement *sink, gpointer)
                 {
                     txAUs++;
                     txBytes += map.size;
-                    if (!GST_BUFFER_FLAG_IS_SET(buf, GST_BUFFER_FLAG_DELTA_UNIT))
+                    if (auHasIdr(map.data, map.size))
                         txKeyframes++;
                 }
             }
@@ -778,14 +800,39 @@ static void stopRx(void)
  * session stays up, and a fresh recorder always opens on an IDR). The
  * v4l2 backend honors both live. */
 
+/* stop-capture completes asynchronously; starting again before the
+ * recorder has torn down wedges the stream, so poll ready-for-capture
+ * before restarting. */
+static gboolean droidRestartPoll(gpointer data)
+{
+    static int tries;
+    if (!tx.pipeline)
+        return G_SOURCE_REMOVE;
+    GstElement *cam = gst_bin_get_by_name(GST_BIN(tx.pipeline), "cam");
+    if (!cam)
+        return G_SOURCE_REMOVE;
+    gboolean ready = FALSE;
+    g_object_get(cam, "ready-for-capture", &ready, nullptr);
+    if (ready || ++tries > 20)
+    {
+        g_signal_emit_by_name(cam, "start-capture");
+        g_print("tx: capture restarted (ready=%d)\n", ready);
+        tries = 0;
+        gst_object_unref(cam);
+        return G_SOURCE_REMOVE;
+    }
+    gst_object_unref(cam);
+    return G_SOURCE_CONTINUE;
+}
+
 static void droidRestartCapture(void)
 {
     GstElement *cam = gst_bin_get_by_name(GST_BIN(tx.pipeline), "cam");
     if (!cam)
         return;
     g_signal_emit_by_name(cam, "stop-capture");
-    g_signal_emit_by_name(cam, "start-capture");
     gst_object_unref(cam);
+    g_timeout_add(100, droidRestartPoll, nullptr);
 }
 
 /* returns how the keyframe was produced, or nullptr on failure */
