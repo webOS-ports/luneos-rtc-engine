@@ -815,6 +815,11 @@ static gboolean droidRestartPoll(gpointer data)
     g_object_get(cam, "ready-for-capture", &ready, nullptr);
     if (ready || ++tries > 20)
     {
+        /* bounce through image mode: droidcamsrc only arms a fresh
+         * recorder on the transition into video mode (the camera app's
+         * proven record/re-record cycle does the same) */
+        g_object_set(cam, "mode", 1, nullptr);
+        g_object_set(cam, "mode", 2, nullptr);
         g_signal_emit_by_name(cam, "start-capture");
         g_print("tx: capture restarted (ready=%d)\n", ready);
         tries = 0;
