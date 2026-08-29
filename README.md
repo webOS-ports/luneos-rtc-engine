@@ -10,13 +10,24 @@ meowcaller's `Call.SendVideo`/`Call.ReceiveVideo` for WhatsApp)
 exchange video in.
 
 ```
- TX: droidcamsrc (recorder mode, hardware H.264, viewfinder-independent)
-     → h264parse (AU aligned) → appsink → tx socket
+ TX: camera → H.264 encode → h264parse (AU aligned) → appsink → tx socket
 
- RX: rx socket → appsrc → h264parse → droidvdec (hardware decode)
-     → waylandsink rendered into a wl_webos_foreign imported window
-       the call UI exports (or a fakesink when headless)
+ RX: rx socket → appsrc → h264parse → H.264 decode
+     → gst-shm for in-app rendering (RtcVideoFactory + VideoOutput),
+       a wl_webos_foreign imported window, or a fakesink
 ```
+
+Two capture/codec backends, chosen at runtime and reported by
+`capabilities`:
+
+- **droid** (Halium devices): droidcamsrc recorder mode — the hardware
+  encoder attached to the camera session, viewfinder-independent — and
+  droidvdec hardware decode.
+- **v4l2** (mainline kernels — PineTab2, PinePhone, PinePhone Pro):
+  v4l2src on the capture-capable video node (`videoDevice` overrides the
+  `camera` index mapping), encoding through `v4l2h264enc` when the
+  kernel offers a stateful encoder, else `x264enc`/`openh264enc`;
+  decoding through `v4l2slh264dec`/`v4l2h264dec`, else software.
 
 ## Control planes
 

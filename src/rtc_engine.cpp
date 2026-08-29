@@ -7,12 +7,16 @@
 // this engine over SOCK_SEQPACKET unix sockets - one access unit per
 // datagram, boundaries preserved by the socket type.
 //
-//   TX: droidcamsrc (recorder mode, hardware H264, viewfinder-independent)
-//       -> h264parse (AU aligned) -> appsink -> tx socket
-//   RX: rx socket -> appsrc -> h264parse -> droidvdec -> waylandsink
-//       rendered into a wl_webos_foreign imported window (the call UI
-//       exports a region and passes its window ID), or a fakesink when
-//       no window is given.
+//   TX: camera -> hardware (or software) H264 encode -> h264parse
+//       (AU aligned) -> appsink -> tx socket
+//   RX: rx socket -> appsrc -> h264parse -> H264 decode -> gst-shm for
+//       in-app rendering, a wl_webos_foreign imported window, or a
+//       fakesink.
+//
+// Two capture/codec backends, chosen at runtime: droidmedia on Halium
+// devices (droidcamsrc recorder mode, droidvdec) and plain V4L2 on
+// mainline kernels (v4l2src, the kernel's stateful/stateless codec
+// nodes, software fallbacks).
 //
 // Control planes:
 //   argv:  --tx= --rx= --camera= --bitrate= --window-id=   (standalone)
@@ -35,9 +39,15 @@
 #include <memory>
 #include <string>
 
+#include <fcntl.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+
+#include <linux/videodev2.h>
+
+#include <vector>
 
 struct Options
 {
@@ -45,6 +55,7 @@ struct Options
     std::string rxSocket;
     std::string windowId;
     std::string shmPath; /* publish decoded frames via gst-shm for in-app rendering */
+    std::string videoDevice; /* explicit v4l2 capture node, overrides camera index */
     int camera   = 0;
     int width    = 1280;
     int height   = 720;
@@ -57,6 +68,99 @@ struct Options
 static GMainLoop *loop;
 static guint64 txAUs, rxAUs, rxFrames;
 static bool sessionRunning;
+
+/* ---------------- capture/codec backends ----------------
+ *
+ * The engine is backend-agnostic: on Halium devices the droidmedia stack
+ * provides camera and codecs (droidcamsrc recorder mode, droidvdec), on
+ * mainline kernels plain V4L2 does (v4l2src plus the kernel's stateful or
+ * stateless codec nodes, with software fallbacks). Everything above the
+ * pipeline fragments - the LS2 API, the AU sockets, shm/foreign
+ * rendering, resource management, the device policy - is shared. */
+
+static bool haveFactory(const char *name)
+{
+    GstElementFactory *factory = gst_element_factory_find(name);
+    if (!factory)
+        return false;
+    gst_object_unref(factory);
+    return true;
+}
+
+static bool droidBackend(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+        cached = haveFactory("droidcamsrc") ? 1 : 0;
+    return cached == 1;
+}
+
+static const char *pickDecoder(void)
+{
+    static const char *candidates[] = {
+        "droidvdec",     /* droidmedia hardware decode */
+        "v4l2slh264dec", /* mainline stateless (hantro, cedrus, ...) */
+        "v4l2h264dec",   /* mainline stateful */
+        "avdec_h264",    /* software fallbacks */
+        "openh264dec",
+        nullptr,
+    };
+    for (int i = 0; candidates[i]; i++)
+        if (haveFactory(candidates[i]))
+            return candidates[i];
+    return nullptr;
+}
+
+/* Encoder fragment for the v4l2 backend, bitrate in bits per second. */
+static gchar *pickV4l2EncoderDesc(int bitrate)
+{
+    if (haveFactory("v4l2h264enc"))
+        return g_strdup_printf(
+            "v4l2h264enc extra-controls=\"controls,video_bitrate=%d\"", bitrate);
+    if (haveFactory("x264enc"))
+        return g_strdup_printf(
+            "x264enc bitrate=%d tune=zerolatency speed-preset=ultrafast "
+            "key-int-max=60 bframes=0",
+            bitrate / 1000);
+    if (haveFactory("openh264enc"))
+        return g_strdup_printf("openh264enc bitrate=%d", bitrate);
+    return nullptr;
+}
+
+/* Capture-capable /dev/video nodes in index order, skipping codec and
+ * other memory-to-memory devices (those advertise an output side too). */
+static std::vector<std::string> v4l2CaptureDevices(void)
+{
+    std::vector<std::string> devices;
+    for (int n = 0; n < 64; n++)
+    {
+        gchar *path = g_strdup_printf("/dev/video%d", n);
+        int fd      = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+        if (fd >= 0)
+        {
+            struct v4l2_capability cap
+            {
+            };
+            if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0)
+            {
+                guint32 caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS)
+                                   ? cap.device_caps
+                                   : cap.capabilities;
+                bool capture = caps & (V4L2_CAP_VIDEO_CAPTURE |
+                                       V4L2_CAP_VIDEO_CAPTURE_MPLANE);
+                bool m2m     = caps & (V4L2_CAP_VIDEO_M2M |
+                                   V4L2_CAP_VIDEO_M2M_MPLANE |
+                                   V4L2_CAP_VIDEO_OUTPUT |
+                                   V4L2_CAP_VIDEO_OUTPUT_MPLANE);
+                if (capture && !m2m)
+                    devices.push_back(path);
+            }
+            close(fd);
+        }
+        g_free(path);
+    }
+    return devices;
+}
 
 /* ---------------- uMediaServer resources ---------------- */
 
@@ -171,6 +275,7 @@ struct TxState
     guint modeTimeout    = 0;
     guint captureTimeout = 0;
     bool loopback        = false;
+    bool droid           = false;
     std::string socketPath;
 } tx;
 
@@ -250,18 +355,57 @@ static bool startTx(const Options &o)
         tx.listenWatch = g_unix_fd_add(tx.listenFd, G_IO_IN, txAcceptCb, nullptr);
     }
 
-    gchar *desc = g_strdup_printf(
-        "droidcamsrc name=cam camera-device=%d target-bitrate=%d "
-        "cam.imgsrc ! fakesink async=false "
-        "cam.vfsrc ! capsfilter caps=video/x-raw,format=NV21 ! "
-        "queue leaky=downstream max-size-buffers=4 ! fakesink sync=false "
-        "cam.vidsrc ! video/x-h264,width=%d,height=%d ! "
-        "h264parse config-interval=-1 ! "
-        "video/x-h264,stream-format=byte-stream,alignment=au ! "
-        "appsink name=txsink emit-signals=true sync=false max-buffers=8 drop=false",
-        o.camera, o.bitrate, o.width, o.height);
-    GError *err  = nullptr;
-    tx.pipeline  = gst_parse_launch(desc, &err);
+    tx.droid = droidBackend();
+    gchar *desc;
+    if (tx.droid)
+    {
+        desc = g_strdup_printf(
+            "droidcamsrc name=cam camera-device=%d target-bitrate=%d "
+            "cam.imgsrc ! fakesink async=false "
+            "cam.vfsrc ! capsfilter caps=video/x-raw,format=NV21 ! "
+            "queue leaky=downstream max-size-buffers=4 ! fakesink sync=false "
+            "cam.vidsrc ! video/x-h264,width=%d,height=%d ! "
+            "h264parse config-interval=-1 ! "
+            "video/x-h264,stream-format=byte-stream,alignment=au ! "
+            "appsink name=txsink emit-signals=true sync=false max-buffers=8 "
+            "drop=false",
+            o.camera, o.bitrate, o.width, o.height);
+    }
+    else
+    {
+        std::string device = o.videoDevice;
+        if (device.empty())
+        {
+            std::vector<std::string> cameras = v4l2CaptureDevices();
+            if (cameras.empty())
+            {
+                g_printerr("tx: no v4l2 capture devices\n");
+                return false;
+            }
+            device = cameras[o.camera >= 0 &&
+                                     (size_t)o.camera < cameras.size()
+                                 ? o.camera
+                                 : 0];
+        }
+        gchar *encoder = pickV4l2EncoderDesc(o.bitrate);
+        if (!encoder)
+        {
+            g_printerr("tx: no h264 encoder available\n");
+            return false;
+        }
+        desc = g_strdup_printf(
+            "v4l2src name=cam device=%s ! "
+            "videoconvert ! videoscale ! "
+            "video/x-raw,width=%d,height=%d ! %s ! "
+            "h264parse config-interval=-1 ! "
+            "video/x-h264,stream-format=byte-stream,alignment=au ! "
+            "appsink name=txsink emit-signals=true sync=false max-buffers=8 "
+            "drop=false",
+            device.c_str(), o.width, o.height, encoder);
+        g_free(encoder);
+    }
+    GError *err = nullptr;
+    tx.pipeline = gst_parse_launch(desc, &err);
     g_free(desc);
     if (!tx.pipeline)
     {
@@ -276,11 +420,19 @@ static bool startTx(const Options &o)
 
     gst_element_set_state(tx.pipeline, GST_STATE_PLAYING);
 
-    /* video mode + start-capture begins the hardware-encoded stream on
-     * vidsrc while the raw viewfinder branch keeps the preview path
-     * available (needs gst-droid's recorder-in-raw-preview patch). The
-     * camera takes a few seconds to open; switching modes or starting the
-     * capture before the device is running is silently ignored. */
+    /* droid: video mode + start-capture begins the hardware-encoded
+     * stream on vidsrc while the raw viewfinder branch keeps the preview
+     * path available (needs gst-droid's recorder-in-raw-preview patch).
+     * The camera takes a few seconds to open; switching modes or starting
+     * the capture before the device is running is silently ignored. The
+     * v4l2 backend just streams once PLAYING. */
+    if (!tx.droid)
+    {
+        g_print("tx: capture started\n");
+        g_print("tx: streaming camera %d h264 %dx%d @%dbps to %s\n", o.camera,
+                o.width, o.height, o.bitrate, o.txSocket.c_str());
+        return true;
+    }
     tx.modeTimeout = g_timeout_add_seconds(4, +[](gpointer) -> gboolean {
         tx.modeTimeout = 0;
         if (!tx.pipeline)
@@ -315,11 +467,14 @@ static void stopTx(void)
     tx.modeTimeout = tx.captureTimeout = 0;
     if (tx.pipeline)
     {
-        GstElement *cam = gst_bin_get_by_name(GST_BIN(tx.pipeline), "cam");
-        if (cam)
+        if (tx.droid)
         {
-            g_signal_emit_by_name(cam, "stop-capture");
-            gst_object_unref(cam);
+            GstElement *cam = gst_bin_get_by_name(GST_BIN(tx.pipeline), "cam");
+            if (cam)
+            {
+                g_signal_emit_by_name(cam, "stop-capture");
+                gst_object_unref(cam);
+            }
         }
         gst_element_set_state(tx.pipeline, GST_STATE_NULL);
         gst_object_unref(tx.pipeline);
@@ -508,11 +663,18 @@ static bool startRx(const Options &o)
             "videoconvert ! %swaylandsink name=rxsink sync=false", flip);
     else
         sinks = g_strdup("fakesink name=rxsink sync=false");
+    const char *decoder = pickDecoder();
+    if (!decoder)
+    {
+        g_printerr("rx: no h264 decoder available\n");
+        g_free(sinks);
+        return false;
+    }
     gchar *desc = g_strdup_printf(
         "appsrc name=rxsrc is-live=true format=time do-timestamp=true "
         "caps=video/x-h264,stream-format=byte-stream,alignment=au ! "
-        "h264parse ! droidvdec ! %s",
-        sinks);
+        "h264parse ! %s ! %s",
+        decoder, sinks);
     g_free(sinks);
     rx.pipeline = gst_parse_launch(desc, &err);
     g_free(desc);
@@ -655,6 +817,8 @@ static bool svcStart(LSHandle *sh, LSMessage *msg, void *)
         o.windowId = v["windowId"].asString();
     if (v["shmPath"].isString())
         o.shmPath = v["shmPath"].asString();
+    if (v["videoDevice"].isString())
+        o.videoDevice = v["videoDevice"].asString();
     if (v["camera"].isNumber())
         o.camera = v["camera"].asNumber<int32_t>();
     if (v["bitrate"].isNumber())
@@ -705,14 +869,18 @@ static bool svcStop(LSHandle *sh, LSMessage *msg, void *)
     return true;
 }
 
-/* Camera presence, probed from droidcamsrc's camera-device property
- * range at READY (the gst-droid notifier pattern): the platform may
- * ship the whole video-call stack yet have no physical camera. */
+/* Camera presence. droid: droidcamsrc's camera-device property range at
+ * READY (the gst-droid notifier pattern). mainline: capture-capable
+ * /dev/video nodes. Either way the platform may ship the whole
+ * video-call stack yet have no usable camera - the deviceinfo policy
+ * overrides this probe. */
 static int probeCameraCount(void)
 {
     static int cached = -1;
     if (cached >= 0)
         return cached;
+    if (!droidBackend())
+        return cached = (int)v4l2CaptureDevices().size();
     GstElement *cam = gst_element_factory_make("droidcamsrc", nullptr);
     if (!cam)
         return cached = 0;
@@ -751,13 +919,15 @@ static const char *videoCallPolicy(void)
 
 static bool svcCapabilities(LSHandle *sh, LSMessage *msg, void *)
 {
-    int cameras        = probeCameraCount();
-    const char *policy = videoCallPolicy();
-    bool capable       = policy ? strcmp(policy, "true") == 0 : cameras > 0;
-    gchar *reply       = g_strdup_printf(
+    int cameras         = probeCameraCount();
+    const char *policy  = videoCallPolicy();
+    const char *decoder = pickDecoder();
+    bool capable = policy ? strcmp(policy, "true") == 0 : cameras > 0;
+    gchar *reply = g_strdup_printf(
         "{\"returnValue\":true,\"cameraCount\":%d,\"videoCallCapable\":%s,"
-        "\"policy\":\"%s\"}",
-        cameras, capable ? "true" : "false", policy ? "deviceinfo" : "derived");
+        "\"policy\":\"%s\",\"backend\":\"%s\",\"decoder\":\"%s\"}",
+        cameras, capable ? "true" : "false", policy ? "deviceinfo" : "derived",
+        droidBackend() ? "droid" : "v4l2", decoder ? decoder : "none");
     lsReply(sh, msg, reply);
     g_free(reply);
     return true;
@@ -846,6 +1016,8 @@ int main(int argc, char **argv)
             o.rotation = atoi(v);
         else if (const char *v = val("--shm="))
             o.shmPath = v;
+        else if (const char *v = val("--video-device="))
+            o.videoDevice = v;
         else if (a == "--loopback")
             o.loopback = true;
         else if (a == "--service")
