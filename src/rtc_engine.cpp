@@ -44,11 +44,12 @@ struct Options
     std::string txSocket;
     std::string rxSocket;
     std::string windowId;
-    int camera  = 0;
-    int width   = 1280;
-    int height  = 720;
-    int bitrate = 2000000;
-    int fps     = 30;
+    int camera   = 0;
+    int width    = 1280;
+    int height   = 720;
+    int bitrate  = 2000000;
+    int fps      = 30;
+    int rotation = 0; /* degrees clockwise applied at render: 0/90/180/270 */
 };
 
 static GMainLoop *loop;
@@ -429,21 +430,41 @@ static bool startRx(const Options &o)
             return false;
         }
         rx.windowAttached = true;
-        rx.renderWidth    = o.width;
-        rx.renderHeight   = o.height;
-        windowManager.setVideoSize(o.width, o.height);
+        bool swapped      = o.rotation == 90 || o.rotation == 270;
+        rx.renderWidth    = swapped ? o.height : o.width;
+        rx.renderHeight   = swapped ? o.width : o.height;
+        windowManager.setVideoSize(rx.renderWidth, rx.renderHeight);
         g_print("rx: imported window %s\n", o.windowId.c_str());
     }
 
-    GError *err       = nullptr;
-    const char *sinks = onScreen
-                            ? "videoconvert ! waylandsink name=rxsink sync=false"
-                            : "fakesink name=rxsink sync=false";
-    gchar *desc       = g_strdup_printf(
+    /* The encoded stream carries unrotated sensor frames; phone camera
+     * sensors are landscape-mounted, so the caller tells us how far to
+     * rotate at render. */
+    const char *flip = "";
+    switch (((o.rotation % 360) + 360) % 360)
+    {
+    case 90:
+        flip = "videoflip method=clockwise ! ";
+        break;
+    case 180:
+        flip = "videoflip method=rotate-180 ! ";
+        break;
+    case 270:
+        flip = "videoflip method=counterclockwise ! ";
+        break;
+    }
+
+    GError *err = nullptr;
+    gchar *sinks =
+        onScreen ? g_strdup_printf(
+                       "videoconvert ! %swaylandsink name=rxsink sync=false", flip)
+                 : g_strdup("fakesink name=rxsink sync=false");
+    gchar *desc = g_strdup_printf(
         "appsrc name=rxsrc is-live=true format=time do-timestamp=true "
         "caps=video/x-h264,stream-format=byte-stream,alignment=au ! "
         "h264parse ! droidvdec ! %s",
         sinks);
+    g_free(sinks);
     rx.pipeline = gst_parse_launch(desc, &err);
     g_free(desc);
     if (!rx.pipeline)
@@ -588,6 +609,8 @@ static bool svcStart(LSHandle *sh, LSMessage *msg, void *)
         o.width = v["width"].asNumber<int32_t>();
     if (v["height"].isNumber())
         o.height = v["height"].asNumber<int32_t>();
+    if (v["rotation"].isNumber())
+        o.rotation = v["rotation"].asNumber<int32_t>();
     if (v["txEnabled"].isBoolean() && !v["txEnabled"].asBool())
         o.txSocket.clear();
     if (v["rxEnabled"].isBoolean() && !v["rxEnabled"].asBool())
@@ -696,6 +719,8 @@ int main(int argc, char **argv)
             o.bitrate = atoi(v);
         else if (const char *v = val("--window-id="))
             o.windowId = v;
+        else if (const char *v = val("--rotation="))
+            o.rotation = atoi(v);
         else if (a == "--service")
             serviceMode = true;
     }
