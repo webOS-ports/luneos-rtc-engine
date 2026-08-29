@@ -1,0 +1,19 @@
+{
+    "exeName": "/usr/sbin/luneos-rtc-engine",
+    "type": "regular",
+    "trustLevel": "oem",
+    "allowedNames": [
+        "org.webosports.rtcengine",
+        "com.webos.rm.client*"
+    ],
+    "permissions": [
+        {
+            "service": "org.webosports.rtcengine",
+            "outbound": ["*"]
+        },
+        {
+            "service": "com.webos.rm.client*",
+            "outbound": ["com.webos.media"]
+        }
+    ]
+}

@@ -1,0 +1,19 @@
+{
+    "id": "org.webosports.rtcengine",
+    "version": "1.0.0",
+    "roleFiles": [
+        "/usr/share/luna-service2/roles.d/org.webosports.rtcengine.role.json"
+    ],
+    "serviceFiles": [
+        "/usr/share/luna-service2/services.d/org.webosports.rtcengine.service"
+    ],
+    "apiPermissionFiles": [
+        "/usr/share/luna-service2/api-permissions.d/org.webosports.rtcengine.api.json"
+    ],
+    "clientPermissionFiles": [
+        "/usr/share/luna-service2/client-permissions.d/org.webosports.rtcengine.perm.json"
+    ],
+    "groupsFiles": [
+        "/usr/share/luna-service2/groups.d/org.webosports.rtcengine.groups.json"
+    ]
+}

@@ -1,0 +1,7 @@
+{
+    "rtc.operation": [
+        "org.webosports.rtcengine/start",
+        "org.webosports.rtcengine/stop",
+        "org.webosports.rtcengine/status"
+    ]
+}

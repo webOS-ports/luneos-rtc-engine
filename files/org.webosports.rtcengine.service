@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.webosports.rtcengine
+Exec=/usr/sbin/luneos-rtc-engine --service
+Type=dynamic
