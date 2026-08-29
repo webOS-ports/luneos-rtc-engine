@@ -277,6 +277,11 @@ struct TxState
     bool loopback        = false;
     bool droid           = false;
     std::string socketPath;
+    /* peerFd is written by the accept handler on the main loop and used
+     * by the sample callback on a GStreamer streaming thread; without
+     * the lock a reconnect could close the fd mid-send (and the number
+     * be recycled for an unrelated descriptor). */
+    GMutex peerLock;
 } tx;
 
 static gboolean txAcceptCb(gint fd, GIOCondition, gpointer)
@@ -284,11 +289,13 @@ static gboolean txAcceptCb(gint fd, GIOCondition, gpointer)
     int peer = accept(fd, nullptr, nullptr);
     if (peer >= 0)
     {
+        int sz = 1 << 20;
+        setsockopt(peer, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
+        g_mutex_lock(&tx.peerLock);
         if (tx.peerFd >= 0)
             close(tx.peerFd);
         tx.peerFd = peer;
-        int sz    = 1 << 20;
-        setsockopt(peer, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
+        g_mutex_unlock(&tx.peerLock);
         g_print("tx: peer connected\n");
     }
     return G_SOURCE_CONTINUE;
@@ -315,18 +322,25 @@ static GstFlowReturn txSampleCb(GstElement *sink, gpointer)
             txAUs++;
             rxAUs++;
         }
-        else if (tx.peerFd >= 0)
+        else
         {
-            if (send(tx.peerFd, map.data, map.size, MSG_NOSIGNAL) < 0)
+            g_mutex_lock(&tx.peerLock);
+            if (tx.peerFd >= 0)
             {
-                g_printerr("tx: peer gone (%s)\n", strerror(errno));
-                close(tx.peerFd);
-                tx.peerFd = -1;
+                if (send(tx.peerFd, map.data, map.size, MSG_NOSIGNAL) < 0)
+                {
+                    /* g_strerror: this callback runs on a GStreamer
+                     * streaming thread and strerror is not thread safe */
+                    g_printerr("tx: peer gone (%s)\n", g_strerror(errno));
+                    close(tx.peerFd);
+                    tx.peerFd = -1;
+                }
+                else
+                {
+                    txAUs++;
+                }
             }
-            else
-            {
-                txAUs++;
-            }
+            g_mutex_unlock(&tx.peerLock);
         }
         gst_buffer_unmap(buf, &map);
     }
@@ -348,7 +362,7 @@ static bool startTx(const Options &o)
             listen(tx.listenFd, 1) < 0)
         {
             g_printerr("tx: bind/listen %s: %s\n", o.txSocket.c_str(),
-                       strerror(errno));
+                       g_strerror(errno));
             return false;
         }
         tx.socketPath  = o.txSocket;
@@ -483,11 +497,15 @@ static void stopTx(void)
     if (tx.listenWatch)
         g_source_remove(tx.listenWatch);
     tx.listenWatch = 0;
+    /* pipeline is NULL by now, so no streaming thread holds the lock */
+    g_mutex_lock(&tx.peerLock);
     if (tx.peerFd >= 0)
         close(tx.peerFd);
+    tx.peerFd = -1;
+    g_mutex_unlock(&tx.peerLock);
     if (tx.listenFd >= 0)
         close(tx.listenFd);
-    tx.peerFd = tx.listenFd = -1;
+    tx.listenFd = -1;
     if (!tx.socketPath.empty())
         unlink(tx.socketPath.c_str());
     tx.socketPath.clear();
@@ -497,7 +515,7 @@ static void stopTx(void)
 
 static LSM::CameraWindowManager windowManager;
 
-static gboolean rxDataCb(gint fd, GIOCondition cond, gpointer)
+static gboolean rxDataCb(gint fd, GIOCondition, gpointer)
 {
     static char buf[1 << 20];
     ssize_t n = recv(fd, buf, sizeof(buf), 0);
@@ -592,7 +610,7 @@ static bool startRx(const Options &o)
             listen(rx.listenFd, 1) < 0)
         {
             g_printerr("rx: bind/listen %s: %s\n", o.rxSocket.c_str(),
-                       strerror(errno));
+                       g_strerror(errno));
             return false;
         }
         rx.socketPath  = o.rxSocket;
@@ -635,6 +653,8 @@ static bool startRx(const Options &o)
         break;
     case 270:
         flip = "videoflip method=counterclockwise ! ";
+        break;
+    default:
         break;
     }
 
