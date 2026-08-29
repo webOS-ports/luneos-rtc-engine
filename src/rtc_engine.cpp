@@ -493,9 +493,11 @@ static bool startRx(const Options &o)
         unlink(o.shmPath.c_str());
         /* The leaky queue keeps the decoder running while no reader is
          * draining the shm pool (shmsink blocks once it fills). */
+        /* colorimetry pinned so the reader's fully-specified caps match
+         * the bytes we write */
         sinks = g_strdup_printf(
             "videoconvert ! %svideoscale ! "
-            "video/x-raw,format=I420,width=%d,height=%d ! "
+            "video/x-raw,format=I420,width=%d,height=%d,colorimetry=bt601 ! "
             "queue leaky=downstream max-size-buffers=4 ! "
             "shmsink name=rxsink socket-path=%s shm-size=8388608 "
             "wait-for-connection=false sync=false",

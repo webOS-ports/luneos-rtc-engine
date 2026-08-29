@@ -32,7 +32,9 @@ QObject *RtcVideoFactory::createShmSource(const QString &socketPath, int width,
      * its source. */
     const QString desc =
         QStringLiteral("shmsrc socket-path=%1 is-live=true do-timestamp=true ! "
-                       "video/x-raw,format=I420,width=%2,height=%3,framerate=30/1 ! "
+                       "video/x-raw,format=I420,width=%2,height=%3,framerate=30/1,"
+                       "pixel-aspect-ratio=1/1,interlace-mode=progressive,"
+                       "colorimetry=bt601 ! "
                        "queue ! videoconvert")
             .arg(socketPath)
             .arg(width)
