@@ -5,6 +5,7 @@
 #include <qqml.h>
 
 #include "foreignexportedregion.h"
+#include "rtcvideofactory.h"
 
 class LuneOSForeignPlugin : public QQmlExtensionPlugin
 {
@@ -16,6 +17,11 @@ public:
     {
         qmlRegisterType<ForeignExportedRegion>(uri, 1, 0,
                                                "ForeignExportedRegion");
+        qmlRegisterSingletonType<RtcVideoFactory>(
+            uri, 1, 0, "RtcVideoFactory",
+            [](QQmlEngine *, QJSEngine *) -> QObject * {
+                return new RtcVideoFactory();
+            });
     }
 };
 

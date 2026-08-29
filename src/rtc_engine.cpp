@@ -44,6 +44,7 @@ struct Options
     std::string txSocket;
     std::string rxSocket;
     std::string windowId;
+    std::string shmPath; /* publish decoded frames via gst-shm for in-app rendering */
     int camera   = 0;
     int width    = 1280;
     int height   = 720;
@@ -443,7 +444,12 @@ static bool startRx(const Options &o)
         rx.listenWatch = g_unix_fd_add(rx.listenFd, G_IO_IN, rxAcceptCb, nullptr);
     }
 
-    bool onScreen = !o.windowId.empty();
+    /* Rendering: gst-shm hands decoded frames to the app to composite as
+     * a regular QML item (the LuneOS-native path - correct card stacking,
+     * no compositor involvement); wl_webos_foreign punch-through remains
+     * for OSE-style clients. */
+    bool toShm    = !o.shmPath.empty();
+    bool onScreen = !toShm && !o.windowId.empty();
     if (onScreen)
     {
         if (!windowManager.registerID(o.windowId.c_str(), nullptr) ||
@@ -478,10 +484,25 @@ static bool startRx(const Options &o)
     }
 
     GError *err = nullptr;
-    gchar *sinks =
-        onScreen ? g_strdup_printf(
-                       "videoconvert ! %swaylandsink name=rxsink sync=false", flip)
-                 : g_strdup("fakesink name=rxsink sync=false");
+    gchar *sinks;
+    if (toShm)
+    {
+        bool swapped = o.rotation == 90 || o.rotation == 270;
+        int outW     = swapped ? o.height : o.width;
+        int outH     = swapped ? o.width : o.height;
+        unlink(o.shmPath.c_str());
+        sinks = g_strdup_printf(
+            "videoconvert ! %svideoscale ! "
+            "video/x-raw,format=I420,width=%d,height=%d ! "
+            "shmsink name=rxsink socket-path=%s shm-size=8388608 "
+            "wait-for-connection=false sync=false",
+            flip, outW, outH, o.shmPath.c_str());
+    }
+    else if (onScreen)
+        sinks = g_strdup_printf(
+            "videoconvert ! %swaylandsink name=rxsink sync=false", flip);
+    else
+        sinks = g_strdup("fakesink name=rxsink sync=false");
     gchar *desc = g_strdup_printf(
         "appsrc name=rxsrc is-live=true format=time do-timestamp=true "
         "caps=video/x-h264,stream-format=byte-stream,alignment=au ! "
@@ -627,6 +648,8 @@ static bool svcStart(LSHandle *sh, LSMessage *msg, void *)
                                           : std::string("/tmp/rtc-rx.sock");
     if (v["windowId"].isString())
         o.windowId = v["windowId"].asString();
+    if (v["shmPath"].isString())
+        o.shmPath = v["shmPath"].asString();
     if (v["camera"].isNumber())
         o.camera = v["camera"].asNumber<int32_t>();
     if (v["bitrate"].isNumber())
@@ -757,6 +780,8 @@ int main(int argc, char **argv)
             o.windowId = v;
         else if (const char *v = val("--rotation="))
             o.rotation = atoi(v);
+        else if (const char *v = val("--shm="))
+            o.shmPath = v;
         else if (a == "--loopback")
             o.loopback = true;
         else if (a == "--service")
