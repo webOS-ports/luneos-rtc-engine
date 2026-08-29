@@ -1,13 +1,14 @@
 # luneos-rtc-engine
 
-Real-time video media engine for calls on LuneOS Halium devices.
+Real-time video media engine for calls on LuneOS.
 
 It bridges the device cameras and hardware codecs to a call network
-stack. Hardware-encoded H.264 access units stream out of (and decode
-back in through) `SOCK_SEQPACKET` unix sockets, one access unit per
-datagram — the interface shape messaging call engines (for example
-meowcaller's `Call.SendVideo`/`Call.ReceiveVideo` for WhatsApp)
-exchange video in.
+stack, on both device families LuneOS runs on: Halium devices (through
+the droidmedia stack) and mainline-kernel devices (through V4L2).
+Hardware-encoded H.264 access units stream out of (and decode back in
+through) `SOCK_SEQPACKET` unix sockets, one access unit per datagram —
+the interface shape messaging call engines (for example meowcaller's
+`Call.SendVideo`/`Call.ReceiveVideo` for WhatsApp) exchange video in.
 
 ```
  TX: camera → H.264 encode → h264parse (AU aligned) → appsink → tx socket
@@ -28,6 +29,15 @@ Two capture/codec backends, chosen at runtime and reported by
   `camera` index mapping), encoding through `v4l2h264enc` when the
   kernel offers a stateful encoder, else `x264enc`/`openh264enc`;
   decoding through `v4l2slh264dec`/`v4l2h264dec`, else software.
+
+## Documentation
+
+- [docs/API.md](docs/API.md) — the LS2 service API (method-by-method
+  request/response reference), the AU socket wire contract, the
+  standalone CLI, and the droidmedia runtime-control C API.
+- [docs/QML.md](docs/QML.md) — the `LuneOS.Foreign` QML module
+  (`ForeignExportedRegion`, `RtcVideoFactory`) and how an app renders
+  the received video.
 
 ## Control planes
 
@@ -59,14 +69,17 @@ luna-send -n 1 luna://org.webosports.rtcengine/requestKeyframe '{}'
 luna-send -n 1 luna://org.webosports.rtcengine/setBitrate '{"bitrate":800000}'
 ```
 
-The v4l2 backend applies both live. droidmedia's recorder takes its
-settings only at create time and cannot restart inside a session, so on
-the droid backend a bitrate change applies to the next session
-(`"applied":"next-session"`) and keyframe requests lean on the vendor
-encoder's own periodic IDRs (`"method":"periodic-idr"` — measured ~2 s
-GOP on sargo's Venus). `status` reports `txKeyframes`, `txBytes` and
-the negotiated `txProfile`/`txLevel`, so adapters can observe the real
-cadence and rate.
+The v4l2 backend applies both live. The droid backend applies them live
+too when the container's libdroidmedia exports the runtime encoder
+controls (`droid_media_recorder_request_sync_frame` /
+`droid_media_recorder_set_video_bitrate`, present in GSIs built from
+droidmedia branch `luneos/recorder-runtime-params`); against an older
+container lib it degrades honestly — keyframe requests report the
+vendor encoder's own periodic IDRs (`"method":"periodic-idr"` —
+measured ~2 s GOP on sargo's Venus) and a bitrate change only takes
+effect on the next session. `status` reports `txKeyframes`,
+`txBytes` and the negotiated `txProfile`/`txLevel`, so adapters can
+observe the real cadence and rate.
 
 The `capabilities` method reports the physical camera count and whether
 video calling should be offered. A device adaptation can overrule the
