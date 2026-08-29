@@ -27,6 +27,11 @@ target_link_libraries(luneos-rtc-engine
 
 install(TARGETS luneos-rtc-engine DESTINATION sbin)
 
+option(WITH_QML_PLUGIN "Build the LuneOS.Foreign QML module" ON)
+if(WITH_QML_PLUGIN)
+    add_subdirectory(qml-plugin)
+endif()
+
 set(LS2_DIR share/luna-service2)
 install(FILES files/org.webosports.rtcengine.service
         DESTINATION ${LS2_DIR}/services.d)

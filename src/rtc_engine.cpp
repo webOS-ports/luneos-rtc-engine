@@ -49,7 +49,8 @@ struct Options
     int height   = 720;
     int bitrate  = 2000000;
     int fps      = 30;
-    int rotation = 0; /* degrees clockwise applied at render: 0/90/180/270 */
+    int rotation  = 0; /* degrees clockwise applied at render: 0/90/180/270 */
+    bool loopback = false; /* feed TX access units straight into RX (self-view) */
 };
 
 static GMainLoop *loop;
@@ -142,6 +143,22 @@ static void releaseCodecs(void)
     acquiredResources.clear();
 }
 
+/* ---------------- pipeline state ---------------- */
+
+struct RxState
+{
+    GstElement *pipeline = nullptr;
+    GstElement *appsrc   = nullptr;
+    int listenFd         = -1;
+    int peerFd           = -1;
+    guint listenWatch    = 0;
+    guint peerWatch      = 0;
+    std::string socketPath;
+    bool windowAttached = false;
+    int renderWidth     = 0;
+    int renderHeight    = 0;
+} rx;
+
 /* ---------------- TX ---------------- */
 
 struct TxState
@@ -152,6 +169,7 @@ struct TxState
     guint listenWatch    = 0;
     guint modeTimeout    = 0;
     guint captureTimeout = 0;
+    bool loopback        = false;
     std::string socketPath;
 } tx;
 
@@ -181,7 +199,17 @@ static GstFlowReturn txSampleCb(GstElement *sink, gpointer)
     GstMapInfo map;
     if (buf && gst_buffer_map(buf, &map, GST_MAP_READ))
     {
-        if (tx.peerFd >= 0)
+        if (tx.loopback && rx.appsrc)
+        {
+            GstBuffer *copy = gst_buffer_new_allocate(nullptr, map.size, nullptr);
+            gst_buffer_fill(copy, 0, map.data, map.size);
+            GstFlowReturn fret;
+            g_signal_emit_by_name(rx.appsrc, "push-buffer", copy, &fret);
+            gst_buffer_unref(copy);
+            txAUs++;
+            rxAUs++;
+        }
+        else if (tx.peerFd >= 0)
         {
             if (send(tx.peerFd, map.data, map.size, MSG_NOSIGNAL) < 0)
             {
@@ -202,19 +230,24 @@ static GstFlowReturn txSampleCb(GstElement *sink, gpointer)
 
 static bool startTx(const Options &o)
 {
-    unlink(o.txSocket.c_str());
-    tx.listenFd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
-    sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    g_strlcpy(addr.sun_path, o.txSocket.c_str(), sizeof(addr.sun_path));
-    if (bind(tx.listenFd, (sockaddr *)&addr, sizeof(addr)) < 0 ||
-        listen(tx.listenFd, 1) < 0)
+    tx.loopback = o.loopback;
+    if (!o.txSocket.empty())
     {
-        g_printerr("tx: bind/listen %s: %s\n", o.txSocket.c_str(), strerror(errno));
-        return false;
+        unlink(o.txSocket.c_str());
+        tx.listenFd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+        sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        g_strlcpy(addr.sun_path, o.txSocket.c_str(), sizeof(addr.sun_path));
+        if (bind(tx.listenFd, (sockaddr *)&addr, sizeof(addr)) < 0 ||
+            listen(tx.listenFd, 1) < 0)
+        {
+            g_printerr("tx: bind/listen %s: %s\n", o.txSocket.c_str(),
+                       strerror(errno));
+            return false;
+        }
+        tx.socketPath  = o.txSocket;
+        tx.listenWatch = g_unix_fd_add(tx.listenFd, G_IO_IN, txAcceptCb, nullptr);
     }
-    tx.socketPath  = o.txSocket;
-    tx.listenWatch = g_unix_fd_add(tx.listenFd, G_IO_IN, txAcceptCb, nullptr);
 
     gchar *desc = g_strdup_printf(
         "droidcamsrc name=cam camera-device=%d target-bitrate=%d "
@@ -306,20 +339,6 @@ static void stopTx(void)
 
 /* ---------------- RX ---------------- */
 
-struct RxState
-{
-    GstElement *pipeline = nullptr;
-    GstElement *appsrc   = nullptr;
-    int listenFd         = -1;
-    int peerFd           = -1;
-    guint listenWatch    = 0;
-    guint peerWatch      = 0;
-    std::string socketPath;
-    bool windowAttached = false;
-    int renderWidth     = 0;
-    int renderHeight    = 0;
-} rx;
-
 static LSM::CameraWindowManager windowManager;
 
 static gboolean rxDataCb(gint fd, GIOCondition cond, gpointer)
@@ -406,19 +425,23 @@ static GstBusSyncReply rxBusSyncCb(GstBus *, GstMessage *msg, gpointer)
 
 static bool startRx(const Options &o)
 {
-    unlink(o.rxSocket.c_str());
-    rx.listenFd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
-    sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    g_strlcpy(addr.sun_path, o.rxSocket.c_str(), sizeof(addr.sun_path));
-    if (bind(rx.listenFd, (sockaddr *)&addr, sizeof(addr)) < 0 ||
-        listen(rx.listenFd, 1) < 0)
+    if (!o.rxSocket.empty())
     {
-        g_printerr("rx: bind/listen %s: %s\n", o.rxSocket.c_str(), strerror(errno));
-        return false;
+        unlink(o.rxSocket.c_str());
+        rx.listenFd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+        sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        g_strlcpy(addr.sun_path, o.rxSocket.c_str(), sizeof(addr.sun_path));
+        if (bind(rx.listenFd, (sockaddr *)&addr, sizeof(addr)) < 0 ||
+            listen(rx.listenFd, 1) < 0)
+        {
+            g_printerr("rx: bind/listen %s: %s\n", o.rxSocket.c_str(),
+                       strerror(errno));
+            return false;
+        }
+        rx.socketPath  = o.rxSocket;
+        rx.listenWatch = g_unix_fd_add(rx.listenFd, G_IO_IN, rxAcceptCb, nullptr);
     }
-    rx.socketPath  = o.rxSocket;
-    rx.listenWatch = g_unix_fd_add(rx.listenFd, G_IO_IN, rxAcceptCb, nullptr);
 
     bool onScreen = !o.windowId.empty();
     if (onScreen)
@@ -535,26 +558,29 @@ static const char *startSession(const Options &o, bool withResources)
     if (sessionRunning)
         return "already running";
 
+    bool wantTx = !o.txSocket.empty() || o.loopback;
+    bool wantRx = !o.rxSocket.empty() || o.loopback;
+
     const char *resourceState = "skipped";
     if (withResources)
-        resourceState =
-            acquireCodecs(!o.txSocket.empty(), !o.rxSocket.empty());
+        resourceState = acquireCodecs(wantTx, wantRx);
     if (g_strcmp0(resourceState, "denied") == 0)
         return "resource acquisition denied";
 
     txAUs = rxAUs = rxFrames = 0;
-    if (!o.txSocket.empty() && !startTx(o))
+    /* rx first so a loopback tx has the appsrc to push into */
+    if (wantRx && !startRx(o))
     {
-        stopTx();
+        stopRx();
         releaseCodecs();
-        return "tx start failed";
+        return "rx start failed";
     }
-    if (!o.rxSocket.empty() && !startRx(o))
+    if (wantTx && !startTx(o))
     {
         stopTx();
         stopRx();
         releaseCodecs();
-        return "rx start failed";
+        return "tx start failed";
     }
     sessionRunning = true;
     return nullptr;
@@ -611,6 +637,16 @@ static bool svcStart(LSHandle *sh, LSMessage *msg, void *)
         o.height = v["height"].asNumber<int32_t>();
     if (v["rotation"].isNumber())
         o.rotation = v["rotation"].asNumber<int32_t>();
+    if (v["loopback"].isBoolean() && v["loopback"].asBool())
+    {
+        /* self-view demo: encoded AUs feed straight back into the
+         * decoder, no sockets involved unless explicitly requested */
+        o.loopback = true;
+        if (!v["txSocket"].isString())
+            o.txSocket.clear();
+        if (!v["rxSocket"].isString())
+            o.rxSocket.clear();
+    }
     if (v["txEnabled"].isBoolean() && !v["txEnabled"].asBool())
         o.txSocket.clear();
     if (v["rxEnabled"].isBoolean() && !v["rxEnabled"].asBool())
@@ -721,14 +757,17 @@ int main(int argc, char **argv)
             o.windowId = v;
         else if (const char *v = val("--rotation="))
             o.rotation = atoi(v);
+        else if (a == "--loopback")
+            o.loopback = true;
         else if (a == "--service")
             serviceMode = true;
     }
 
-    if (!serviceMode && o.txSocket.empty() && o.rxSocket.empty())
+    if (!serviceMode && o.txSocket.empty() && o.rxSocket.empty() && !o.loopback)
     {
         g_printerr("usage: %s [--service] [--tx=SOCK] [--rx=SOCK] [--camera=N] "
-                   "[--bitrate=BPS] [--window-id=ID]\n",
+                   "[--bitrate=BPS] [--window-id=ID] [--rotation=DEG] "
+                   "[--loopback]\n",
                    argv[0]);
         return 1;
     }
@@ -738,7 +777,7 @@ int main(int argc, char **argv)
     if (serviceMode && !startService())
         return 1;
 
-    if (!o.txSocket.empty() || !o.rxSocket.empty())
+    if (!o.txSocket.empty() || !o.rxSocket.empty() || o.loopback)
     {
         const char *error = startSession(o, false);
         if (error)
