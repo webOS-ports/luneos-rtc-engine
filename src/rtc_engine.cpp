@@ -807,13 +807,17 @@ static const char *requestKeyframe(void)
 {
     if (!tx.pipeline)
         return nullptr;
-    if (tx.droid)
-        return "periodic-idr";
+    /* both backends take the force-key-unit event: v4l2/software encoders
+     * natively, droidcamsrc through gst-droid's runtime IDR support. When
+     * the droid stack predates it the event is unhandled and the vendor
+     * encoder's periodic IDRs (~2s GOP) remain the recovery story. */
     static guint keyframeSeq;
-    gst_element_send_event(tx.pipeline,
-                           gst_video_event_new_upstream_force_key_unit(
-                               GST_CLOCK_TIME_NONE, TRUE, ++keyframeSeq));
-    return "force-key-unit";
+    gboolean handled = gst_element_send_event(
+        tx.pipeline, gst_video_event_new_upstream_force_key_unit(
+                         GST_CLOCK_TIME_NONE, TRUE, ++keyframeSeq));
+    if (handled)
+        return "force-key-unit";
+    return tx.droid ? "periodic-idr" : nullptr;
 }
 
 /* returns how the bitrate change was applied, or nullptr on failure */
@@ -826,9 +830,12 @@ static const char *setBitrate(int bitrate)
         GstElement *cam = gst_bin_get_by_name(GST_BIN(tx.pipeline), "cam");
         if (!cam)
             return nullptr;
+        /* gst-droid applies this to a live recorder when the in-container
+         * droidmedia supports it; otherwise it takes effect on the next
+         * session */
         g_object_set(cam, "target-bitrate", bitrate, nullptr);
         gst_object_unref(cam);
-        return "next-session";
+        return "live";
     }
     GstElement *enc = gst_bin_get_by_name(GST_BIN(tx.pipeline), "enc");
     if (!enc)
