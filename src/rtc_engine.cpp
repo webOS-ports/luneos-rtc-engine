@@ -793,52 +793,14 @@ static void stopRx(void)
  *
  * The connectors' congestion controllers drive the platform encoder:
  * libtgvoip's SCReAM calls SetBitrate()/RequestKeyFrame() (its PLI
- * equivalent), and Teams needs an IDR on demand instead of its old
- * restart-the-whole-capture hack. droidmedia's recorder takes both
- * settings only at create time, so on the droid backend either request
- * recreates the encoder attach (stop-capture/start-capture: the camera
- * session stays up, and a fresh recorder always opens on an IDR). The
- * v4l2 backend honors both live. */
-
-/* stop-capture completes asynchronously; starting again before the
- * recorder has torn down wedges the stream, so poll ready-for-capture
- * before restarting. */
-static gboolean droidRestartPoll(gpointer data)
-{
-    static int tries;
-    if (!tx.pipeline)
-        return G_SOURCE_REMOVE;
-    GstElement *cam = gst_bin_get_by_name(GST_BIN(tx.pipeline), "cam");
-    if (!cam)
-        return G_SOURCE_REMOVE;
-    gboolean ready = FALSE;
-    g_object_get(cam, "ready-for-capture", &ready, nullptr);
-    if (ready || ++tries > 20)
-    {
-        /* bounce through image mode: droidcamsrc only arms a fresh
-         * recorder on the transition into video mode (the camera app's
-         * proven record/re-record cycle does the same) */
-        g_object_set(cam, "mode", 1, nullptr);
-        g_object_set(cam, "mode", 2, nullptr);
-        g_signal_emit_by_name(cam, "start-capture");
-        g_print("tx: capture restarted (ready=%d)\n", ready);
-        tries = 0;
-        gst_object_unref(cam);
-        return G_SOURCE_REMOVE;
-    }
-    gst_object_unref(cam);
-    return G_SOURCE_CONTINUE;
-}
-
-static void droidRestartCapture(void)
-{
-    GstElement *cam = gst_bin_get_by_name(GST_BIN(tx.pipeline), "cam");
-    if (!cam)
-        return;
-    g_signal_emit_by_name(cam, "stop-capture");
-    gst_object_unref(cam);
-    g_timeout_add(100, droidRestartPoll, nullptr);
-}
+ * equivalent), and Teams wants an IDR on demand. The v4l2 backend
+ * honors both live. droidmedia's recorder takes its settings only at
+ * create time and ignores start-capture reissued inside a session (a
+ * restart attempt wedges the stream), so on the droid backend a
+ * bitrate change applies to the next session and keyframe requests
+ * lean on the vendor encoder's own periodic IDRs (measured ~2s GOP on
+ * sargo's Venus; the txKeyframes counter shows the actual cadence).
+ */
 
 /* returns how the keyframe was produced, or nullptr on failure */
 static const char *requestKeyframe(void)
@@ -846,10 +808,7 @@ static const char *requestKeyframe(void)
     if (!tx.pipeline)
         return nullptr;
     if (tx.droid)
-    {
-        droidRestartCapture();
-        return "encoder-restart";
-    }
+        return "periodic-idr";
     static guint keyframeSeq;
     gst_element_send_event(tx.pipeline,
                            gst_video_event_new_upstream_force_key_unit(
@@ -869,8 +828,7 @@ static const char *setBitrate(int bitrate)
             return nullptr;
         g_object_set(cam, "target-bitrate", bitrate, nullptr);
         gst_object_unref(cam);
-        droidRestartCapture();
-        return "encoder-restart";
+        return "next-session";
     }
     GstElement *enc = gst_bin_get_by_name(GST_BIN(tx.pipeline), "enc");
     if (!enc)

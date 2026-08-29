@@ -59,11 +59,14 @@ luna-send -n 1 luna://org.webosports.rtcengine/requestKeyframe '{}'
 luna-send -n 1 luna://org.webosports.rtcengine/setBitrate '{"bitrate":800000}'
 ```
 
-The v4l2 backend applies both live; droidmedia's recorder takes bitrate
-and produces IDRs only at create time, so the droid backend recreates
-the encoder attach (stop-capture/start-capture — the camera session
-stays up, a fresh recorder opens on an IDR). `status` reports
-`txKeyframes`, `txBytes` and the negotiated `txProfile`/`txLevel`.
+The v4l2 backend applies both live. droidmedia's recorder takes its
+settings only at create time and cannot restart inside a session, so on
+the droid backend a bitrate change applies to the next session
+(`"applied":"next-session"`) and keyframe requests lean on the vendor
+encoder's own periodic IDRs (`"method":"periodic-idr"` — measured ~2 s
+GOP on sargo's Venus). `status` reports `txKeyframes`, `txBytes` and
+the negotiated `txProfile`/`txLevel`, so adapters can observe the real
+cadence and rate.
 
 The `capabilities` method reports the physical camera count and whether
 video calling should be offered. A device adaptation can overrule the
