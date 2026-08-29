@@ -729,12 +729,35 @@ static int probeCameraCount(void)
     return cached = count;
 }
 
+/* Device policy published by luneos-device-config from the adaptation's
+ * deviceinfo (deviceinfo_video_call): a HAL can enumerate cameras that
+ * are wired up but not actually usable, so the derived probe must be
+ * overridable per device. Returns "true"/"false", or nullptr to derive. */
+static const char *videoCallPolicy(void)
+{
+    static char buf[8];
+    FILE *f = fopen("/run/luneos-device/video-call", "r");
+    if (!f)
+        return nullptr;
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    while (n > 0 && g_ascii_isspace(buf[n - 1]))
+        n--;
+    buf[n] = '\0';
+    if (strcmp(buf, "true") == 0 || strcmp(buf, "false") == 0)
+        return buf;
+    return nullptr;
+}
+
 static bool svcCapabilities(LSHandle *sh, LSMessage *msg, void *)
 {
-    int cameras  = probeCameraCount();
-    gchar *reply = g_strdup_printf(
-        "{\"returnValue\":true,\"cameraCount\":%d,\"videoCallCapable\":%s}",
-        cameras, cameras > 0 ? "true" : "false");
+    int cameras        = probeCameraCount();
+    const char *policy = videoCallPolicy();
+    bool capable       = policy ? strcmp(policy, "true") == 0 : cameras > 0;
+    gchar *reply       = g_strdup_printf(
+        "{\"returnValue\":true,\"cameraCount\":%d,\"videoCallCapable\":%s,"
+        "\"policy\":\"%s\"}",
+        cameras, capable ? "true" : "false", policy ? "deviceinfo" : "derived");
     lsReply(sh, msg, reply);
     g_free(reply);
     return true;

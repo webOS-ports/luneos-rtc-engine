@@ -40,6 +40,12 @@ luna-send -n 1 luna://org.webosports.rtcengine/stop '{}'
 and a resource policy action stops the session, so calls coexist with
 camera recording and media playback.
 
+The `capabilities` method reports the physical camera count and whether
+video calling should be offered. A device adaptation can overrule the
+derived answer with `deviceinfo_video_call="false"` (or `"true"`) —
+luneos-device-config publishes it to `/run/luneos-device/video-call` —
+because a HAL can enumerate cameras that are wired up but not usable.
+
 ## Notes
 
 - `src/camera_window_manager.h` is the public header of
