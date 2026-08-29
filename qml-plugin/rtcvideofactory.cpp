@@ -25,12 +25,14 @@ QObject *RtcVideoFactory::createShmSource(const QString &socketPath, int width,
                                           int height)
 {
 #ifdef HAVE_QGSTREAMER_VIDEO_SOURCE
-    /* The caps must state the exact frame layout: gst-shm carries no
-     * negotiation, just bytes. The tail videoconvert is the bin's only
-     * unlinked pad, which QGStreamerVideoSource ghosts as its source. */
+    /* The caps must fully specify the frame layout - gst-shm carries no
+     * negotiation, just bytes, and capsfilter refuses to stamp buffers
+     * with incomplete caps (framerate included). The tail videoconvert is
+     * the bin's only unlinked pad, which QGStreamerVideoSource ghosts as
+     * its source. */
     const QString desc =
         QStringLiteral("shmsrc socket-path=%1 is-live=true do-timestamp=true ! "
-                       "video/x-raw,format=I420,width=%2,height=%3 ! "
+                       "video/x-raw,format=I420,width=%2,height=%3,framerate=30/1 ! "
                        "queue ! videoconvert")
             .arg(socketPath)
             .arg(width)
