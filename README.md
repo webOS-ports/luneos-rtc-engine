@@ -51,6 +51,20 @@ luna-send -n 1 luna://org.webosports.rtcengine/stop '{}'
 and a resource policy action stops the session, so calls coexist with
 camera recording and media playback.
 
+In-call encoder control, for the connectors' congestion controllers
+(libtgvoip SCReAM `SetBitrate`/`RequestKeyFrame`, Teams PLI):
+
+```
+luna-send -n 1 luna://org.webosports.rtcengine/requestKeyframe '{}'
+luna-send -n 1 luna://org.webosports.rtcengine/setBitrate '{"bitrate":800000}'
+```
+
+The v4l2 backend applies both live; droidmedia's recorder takes bitrate
+and produces IDRs only at create time, so the droid backend recreates
+the encoder attach (stop-capture/start-capture — the camera session
+stays up, a fresh recorder opens on an IDR). `status` reports
+`txKeyframes`, `txBytes` and the negotiated `txProfile`/`txLevel`.
+
 The `capabilities` method reports the physical camera count and whether
 video calling should be offered. A device adaptation can overrule the
 derived answer with `deviceinfo_video_call="false"` (or `"true"`) —

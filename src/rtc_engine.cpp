@@ -25,6 +25,7 @@
 //          policy action from the resource manager stops the session.
 
 #include <gst/gst.h>
+#include <gst/video/video-event.h>
 #include <gst/video/videooverlay.h>
 #include <glib-unix.h>
 
@@ -66,7 +67,7 @@ struct Options
 };
 
 static GMainLoop *loop;
-static guint64 txAUs, rxAUs, rxFrames;
+static guint64 txAUs, txBytes, txKeyframes, rxAUs, rxFrames;
 static bool sessionRunning;
 
 /* ---------------- capture/codec backends ----------------
@@ -116,14 +117,15 @@ static gchar *pickV4l2EncoderDesc(int bitrate)
 {
     if (haveFactory("v4l2h264enc"))
         return g_strdup_printf(
-            "v4l2h264enc extra-controls=\"controls,video_bitrate=%d\"", bitrate);
+            "v4l2h264enc name=enc extra-controls=\"controls,video_bitrate=%d\"",
+            bitrate);
     if (haveFactory("x264enc"))
         return g_strdup_printf(
-            "x264enc bitrate=%d tune=zerolatency speed-preset=ultrafast "
-            "key-int-max=60 bframes=0",
+            "x264enc name=enc bitrate=%d tune=zerolatency "
+            "speed-preset=ultrafast key-int-max=60 bframes=0",
             bitrate / 1000);
     if (haveFactory("openh264enc"))
-        return g_strdup_printf("openh264enc bitrate=%d", bitrate);
+        return g_strdup_printf("openh264enc name=enc bitrate=%d", bitrate);
     return nullptr;
 }
 
@@ -320,6 +322,9 @@ static GstFlowReturn txSampleCb(GstElement *sink, gpointer)
             g_signal_emit_by_name(rx.appsrc, "push-buffer", copy, &fret);
             gst_buffer_unref(copy);
             txAUs++;
+            txBytes += map.size;
+            if (!GST_BUFFER_FLAG_IS_SET(buf, GST_BUFFER_FLAG_DELTA_UNIT))
+                txKeyframes++;
             rxAUs++;
         }
         else
@@ -338,6 +343,9 @@ static GstFlowReturn txSampleCb(GstElement *sink, gpointer)
                 else
                 {
                     txAUs++;
+                    txBytes += map.size;
+                    if (!GST_BUFFER_FLAG_IS_SET(buf, GST_BUFFER_FLAG_DELTA_UNIT))
+                        txKeyframes++;
                 }
             }
             g_mutex_unlock(&tx.peerLock);
@@ -759,6 +767,113 @@ static void stopRx(void)
     rx.socketPath.clear();
 }
 
+/* ---------------- in-call encoder control ----------------
+ *
+ * The connectors' congestion controllers drive the platform encoder:
+ * libtgvoip's SCReAM calls SetBitrate()/RequestKeyFrame() (its PLI
+ * equivalent), and Teams needs an IDR on demand instead of its old
+ * restart-the-whole-capture hack. droidmedia's recorder takes both
+ * settings only at create time, so on the droid backend either request
+ * recreates the encoder attach (stop-capture/start-capture: the camera
+ * session stays up, and a fresh recorder always opens on an IDR). The
+ * v4l2 backend honors both live. */
+
+static void droidRestartCapture(void)
+{
+    GstElement *cam = gst_bin_get_by_name(GST_BIN(tx.pipeline), "cam");
+    if (!cam)
+        return;
+    g_signal_emit_by_name(cam, "stop-capture");
+    g_signal_emit_by_name(cam, "start-capture");
+    gst_object_unref(cam);
+}
+
+/* returns how the keyframe was produced, or nullptr on failure */
+static const char *requestKeyframe(void)
+{
+    if (!tx.pipeline)
+        return nullptr;
+    if (tx.droid)
+    {
+        droidRestartCapture();
+        return "encoder-restart";
+    }
+    static guint keyframeSeq;
+    gst_element_send_event(tx.pipeline,
+                           gst_video_event_new_upstream_force_key_unit(
+                               GST_CLOCK_TIME_NONE, TRUE, ++keyframeSeq));
+    return "force-key-unit";
+}
+
+/* returns how the bitrate change was applied, or nullptr on failure */
+static const char *setBitrate(int bitrate)
+{
+    if (!tx.pipeline || bitrate <= 0)
+        return nullptr;
+    if (tx.droid)
+    {
+        GstElement *cam = gst_bin_get_by_name(GST_BIN(tx.pipeline), "cam");
+        if (!cam)
+            return nullptr;
+        g_object_set(cam, "target-bitrate", bitrate, nullptr);
+        gst_object_unref(cam);
+        droidRestartCapture();
+        return "encoder-restart";
+    }
+    GstElement *enc = gst_bin_get_by_name(GST_BIN(tx.pipeline), "enc");
+    if (!enc)
+        return nullptr;
+    GstElementFactory *factory = gst_element_get_factory(enc);
+    const char *name =
+        factory ? gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory)) : "";
+    if (g_strcmp0(name, "x264enc") == 0)
+        g_object_set(enc, "bitrate", (guint)(bitrate / 1000), nullptr);
+    else if (g_strcmp0(name, "v4l2h264enc") == 0)
+    {
+        GstStructure *controls = gst_structure_new(
+            "controls", "video_bitrate", G_TYPE_INT, bitrate, nullptr);
+        g_object_set(enc, "extra-controls", controls, nullptr);
+        gst_structure_free(controls);
+    }
+    else
+        g_object_set(enc, "bitrate", (guint)bitrate, nullptr);
+    gst_object_unref(enc);
+    return "live";
+}
+
+/* negotiated H.264 profile/level from the tx appsink's pad, once the
+ * stream is up ("?" before negotiation) */
+static void txStreamInfo(const char **profile, const char **level)
+{
+    static gchar profileBuf[32], levelBuf[16];
+    *profile = *level = "?";
+    if (!tx.pipeline)
+        return;
+    GstElement *sink = gst_bin_get_by_name(GST_BIN(tx.pipeline), "txsink");
+    if (!sink)
+        return;
+    GstPad *pad = gst_element_get_static_pad(sink, "sink");
+    if (GstCaps *caps = gst_pad_get_current_caps(pad))
+    {
+        GstStructure *s = gst_caps_get_structure(caps, 0);
+        const gchar *p  = gst_structure_get_string(s, "profile");
+        const gchar *l  = gst_structure_get_string(s, "level");
+        if (p)
+        {
+            g_strlcpy(profileBuf, p, sizeof(profileBuf));
+            *profile = profileBuf;
+        }
+        if (l)
+        {
+            g_strlcpy(levelBuf, l, sizeof(levelBuf));
+            *level = levelBuf;
+        }
+        gst_caps_unref(caps);
+    }
+    gst_object_unref(pad);
+    gst_object_unref(sink);
+}
+
 /* ---------------- session ---------------- */
 
 static const char *startSession(const Options &o, bool withResources)
@@ -775,7 +890,7 @@ static const char *startSession(const Options &o, bool withResources)
     if (g_strcmp0(resourceState, "denied") == 0)
         return "resource acquisition denied";
 
-    txAUs = rxAUs = rxFrames = 0;
+    txAUs = txBytes = txKeyframes = rxAUs = rxFrames = 0;
     /* rx first so a loopback tx has the appsrc to push into */
     if (wantRx && !startRx(o))
     {
@@ -955,10 +1070,49 @@ static bool svcCapabilities(LSHandle *sh, LSMessage *msg, void *)
 
 static bool svcStatus(LSHandle *sh, LSMessage *msg, void *)
 {
+    const char *profile, *level;
+    txStreamInfo(&profile, &level);
     gchar *reply = g_strdup_printf(
         "{\"returnValue\":true,\"running\":%s,\"txAus\":%" G_GUINT64_FORMAT
-        ",\"rxAus\":%" G_GUINT64_FORMAT ",\"rxFrames\":%" G_GUINT64_FORMAT "}",
-        sessionRunning ? "true" : "false", txAUs, rxAUs, rxFrames);
+        ",\"txBytes\":%" G_GUINT64_FORMAT ",\"txKeyframes\":%" G_GUINT64_FORMAT
+        ",\"rxAus\":%" G_GUINT64_FORMAT ",\"rxFrames\":%" G_GUINT64_FORMAT
+        ",\"txProfile\":\"%s\",\"txLevel\":\"%s\"}",
+        sessionRunning ? "true" : "false", txAUs, txBytes, txKeyframes, rxAUs,
+        rxFrames, profile, level);
+    lsReply(sh, msg, reply);
+    g_free(reply);
+    return true;
+}
+
+static bool svcRequestKeyframe(LSHandle *sh, LSMessage *msg, void *)
+{
+    const char *how = sessionRunning ? requestKeyframe() : nullptr;
+    gchar *reply =
+        how ? g_strdup_printf("{\"returnValue\":true,\"method\":\"%s\"}", how)
+            : g_strdup("{\"returnValue\":false,\"errorText\":\"no active tx\"}");
+    lsReply(sh, msg, reply);
+    g_free(reply);
+    return true;
+}
+
+static bool svcSetBitrate(LSHandle *sh, LSMessage *msg, void *)
+{
+    int bitrate = 0;
+    pbnjson::JDomParser parser;
+    const char *raw = LSMessageGetPayload(msg);
+    if (raw && parser.parse(raw, pbnjson::JSchema::AllSchema()))
+    {
+        pbnjson::JValue v = parser.getDom();
+        if (v["bitrate"].isNumber())
+            bitrate = v["bitrate"].asNumber<int32_t>();
+    }
+    const char *how = sessionRunning ? setBitrate(bitrate) : nullptr;
+    gchar *reply =
+        how ? g_strdup_printf(
+                  "{\"returnValue\":true,\"bitrate\":%d,\"applied\":\"%s\"}",
+                  bitrate, how)
+            : g_strdup("{\"returnValue\":false,\"errorText\":\"no active tx "
+                       "or bad bitrate\"}");
     lsReply(sh, msg, reply);
     g_free(reply);
     return true;
@@ -969,6 +1123,8 @@ static LSMethod serviceMethods[] = {
     {"stop", svcStop, LUNA_METHOD_FLAGS_NONE},
     {"status", svcStatus, LUNA_METHOD_FLAGS_NONE},
     {"capabilities", svcCapabilities, LUNA_METHOD_FLAGS_NONE},
+    {"requestKeyframe", svcRequestKeyframe, LUNA_METHOD_FLAGS_NONE},
+    {"setBitrate", svcSetBitrate, LUNA_METHOD_FLAGS_NONE},
     {nullptr, nullptr, LUNA_METHOD_FLAGS_NONE},
 };
 

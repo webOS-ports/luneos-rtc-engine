@@ -3,6 +3,8 @@
         "org.webosports.rtcengine/start",
         "org.webosports.rtcengine/stop",
         "org.webosports.rtcengine/status",
-        "org.webosports.rtcengine/capabilities"
+        "org.webosports.rtcengine/capabilities",
+        "org.webosports.rtcengine/requestKeyframe",
+        "org.webosports.rtcengine/setBitrate"
     ]
 }
