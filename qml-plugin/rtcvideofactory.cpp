@@ -42,3 +42,14 @@ QObject *RtcVideoFactory::createShmSource(const QString &socketPath, int width,
     return nullptr;
 #endif
 }
+
+void RtcVideoFactory::stopShmSource(QObject *source)
+{
+#ifdef HAVE_QGSTREAMER_VIDEO_SOURCE
+    auto *video = qobject_cast<QGStreamerVideoSource *>(source);
+    if (!video || !rtcShmReaderStop(video->gstElement()))
+        qWarning() << "RtcVideoFactory: stopShmSource: not a shm video source";
+#else
+    Q_UNUSED(source);
+#endif
+}

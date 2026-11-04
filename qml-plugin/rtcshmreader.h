@@ -37,4 +37,18 @@ std::string rtcShmReaderDescription(const std::string &socketPath, int width,
  * reader. */
 bool rtcShmReaderDetach(GstElement *bin);
 
+/* Stops the reader in bin and clears out what it already passed on, before
+ * Qt Multimedia tears the source down (QGStreamerVideoSource::stop()).
+ *
+ * Qt unlinks the source in an IDLE pad probe whose data lives on its stack.
+ * A streaming thread pushing a non-serialized upstream event (the video
+ * sink's QoS after every frame) through that pad runs the probe a second
+ * time, possibly after Qt has returned: a crash in that thread (the Phone
+ * app on sargo, 2026-11-04, camera turned off during a video call). With
+ * the reader stopped and the frames already downstream flushed, the sink
+ * renders nothing more and sends no QoS, so no thread but Qt's is at the
+ * pad. The bin cannot be started again afterwards. False when bin has no
+ * such reader. */
+bool rtcShmReaderStop(GstElement *bin);
+
 #endif // RTCSHMREADER_H

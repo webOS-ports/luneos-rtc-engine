@@ -63,3 +63,37 @@ bool rtcShmReaderDetach(GstElement *bin)
     gst_object_unref(pad);
     return id != 0;
 }
+
+bool rtcShmReaderStop(GstElement *bin)
+{
+    if (!bin || !GST_IS_BIN(bin))
+        return false;
+    GstElement *src = gst_bin_get_by_name(GST_BIN(bin), RTC_SHM_READER_SRC);
+    if (!src)
+        return false;
+    GstElement *queue = gst_bin_get_by_name(GST_BIN(bin), RTC_SHM_READER_QUEUE);
+
+    /* No more frames: both streaming threads of the reader stop here (the
+     * state change waits for them). Locked, so the pipeline's own state
+     * changes leave them stopped. */
+    gst_element_set_locked_state(src, TRUE);
+    gst_element_set_state(src, GST_STATE_NULL);
+    if (queue)
+    {
+        gst_element_set_locked_state(queue, TRUE);
+        gst_element_set_state(queue, GST_STATE_NULL);
+        gst_object_unref(queue);
+    }
+    gst_object_unref(src);
+
+    /* The frames already past the reader: flushed out of the queue and the
+     * sink downstream, so nothing is left to render. */
+    GstPad *out = gst_element_get_static_pad(bin, "src");
+    if (out)
+    {
+        gst_pad_push_event(out, gst_event_new_flush_start());
+        gst_pad_push_event(out, gst_event_new_flush_stop(TRUE));
+        gst_object_unref(out);
+    }
+    return true;
+}
