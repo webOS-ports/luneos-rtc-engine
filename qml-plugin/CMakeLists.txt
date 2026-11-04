@@ -26,7 +26,12 @@ target_link_libraries(luneosforeignplugin
 # RtcVideoFactory compiles to a stub otherwise (__has_include).
 find_package(Qt6 QUIET COMPONENTS Multimedia MultimediaPrivate)
 if(TARGET Qt6::MultimediaPrivate)
-    target_link_libraries(luneosforeignplugin Qt6::Multimedia Qt6::MultimediaPrivate)
+    # The shm reader works on the GStreamer bin itself (rtcshmreader.h).
+    pkg_check_modules(GST REQUIRED gstreamer-1.0)
+    target_sources(luneosforeignplugin PRIVATE rtcshmreader.cpp)
+    target_include_directories(luneosforeignplugin PRIVATE ${GST_INCLUDE_DIRS})
+    target_link_libraries(luneosforeignplugin Qt6::Multimedia Qt6::MultimediaPrivate
+        ${GST_LIBRARIES})
 endif()
 
 install(TARGETS luneosforeignplugin DESTINATION lib/qml/LuneOS/Foreign)

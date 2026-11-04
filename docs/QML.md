@@ -24,6 +24,13 @@ behavior in the shell, no punch-through, no extra surfaces.
 with no negotiation, so the caps are stamped from these values; a
 mismatch stalls the source with a caps error.
 
+The source copies each frame out of the engine's shared memory as it
+arrives and queues at most two, dropping the oldest. A frame still in
+shared memory holds the engine's shmsink, and Qt Multimedia keeps every
+frame it is given until the GUI thread draws it, so without the copy a
+busy GUI thread (two pictures in a video call) stalled the engine's
+output. Now a slow app loses frames and the engine keeps going.
+
 Usage, as the Phone app's `VideoCallOverlay.qml` does it:
 
 ```qml
