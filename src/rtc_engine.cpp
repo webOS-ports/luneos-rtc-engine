@@ -192,6 +192,7 @@ static std::shared_ptr<uMediaServer::ResourceManagerClient> rmc;
 static std::string acquiredResources;
 
 static void stopSession(void);
+static gboolean quitCb(gpointer);
 
 static bool policyActionCb(const char *action, const char *resources,
                            const char *, const char *, const char *)
@@ -1021,32 +1022,39 @@ static bool svcStop(LSHandle *sh, LSMessage *msg, void *)
     return true;
 }
 
-/* Camera presence. droid: droidcamsrc's camera-device property range at
- * READY (the gst-droid notifier pattern). mainline: capture-capable
- * /dev/video nodes. Either way the platform may ship the whole
- * video-call stack yet have no usable camera - the deviceinfo policy
- * overrides this probe. */
+/* Camera presence. droid: the range of droidcamsrc's camera-device
+ * property, which gst-droid installs when the class is loaded, from
+ * droid_media_camera_get_number_of_cameras(), and only when there are
+ * cameras. mainline: capture-capable /dev/video nodes. Either way the
+ * platform may ship the whole video-call stack yet have no usable camera -
+ * the deviceinfo policy overrides this probe.
+ *
+ * The element is never taken out of NULL, so no camera is opened. The
+ * capability is asked when video comes up on a call, which is when that
+ * call's engine (teams_media, ...) holds the camera: taken to READY, the
+ * element then failed to open it and a phone with two cameras was reported
+ * as having none, for as long as the service ran.
+ *
+ * Only a count above zero is kept; zero is probed again next time. */
 static int probeCameraCount(void)
 {
-    static int cached = -1;
-    if (cached >= 0)
+    static int cached = 0;
+    if (cached > 0)
         return cached;
-    if (!droidBackend())
-        return cached = (int)v4l2CaptureDevices().size();
-    GstElement *cam = gst_element_factory_make("droidcamsrc", nullptr);
-    if (!cam)
-        return cached = 0;
     int count = 0;
-    if (gst_element_set_state(cam, GST_STATE_READY) != GST_STATE_CHANGE_FAILURE)
-    {
+    if (!droidBackend()) {
+        count = (int)v4l2CaptureDevices().size();
+    } else if (GstElement *cam = gst_element_factory_make("droidcamsrc", nullptr)) {
+        gst_object_ref_sink(cam);
         GParamSpec *spec = g_object_class_find_property(
             G_OBJECT_GET_CLASS(cam), "camera-device");
         if (spec && G_IS_PARAM_SPEC_INT(spec))
             count = G_PARAM_SPEC_INT(spec)->maximum + 1;
-        gst_element_set_state(cam, GST_STATE_NULL);
+        gst_object_unref(cam);
     }
-    gst_object_unref(cam);
-    return cached = count;
+    if (count > 0)
+        cached = count;
+    return count;
 }
 
 /* Device policy published by luneos-device-config from the adaptation's
@@ -1082,6 +1090,15 @@ static bool svcCapabilities(LSHandle *sh, LSMessage *msg, void *)
         droidBackend() ? "droid" : "v4l2", decoder ? decoder : "none");
     lsReply(sh, msg, reply);
     g_free(reply);
+    /* gst-droid counts the cameras once per process, when droidcamsrc's
+     * class is loaded: a service started before the camera service was up
+     * would answer 0 for as long as it ran. With no session to keep it,
+     * end the process instead; ls-hubd starts a fresh one, with a fresh
+     * count, for the next request. */
+    if (droidBackend() && cameras == 0 && !tx.pipeline && !rx.pipeline) {
+        g_print("capabilities: droidcamsrc reports no camera, exiting for a fresh count\n");
+        g_idle_add(quitCb, nullptr);
+    }
     return true;
 }
 
