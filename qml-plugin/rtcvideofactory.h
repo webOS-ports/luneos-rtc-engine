@@ -14,6 +14,9 @@
  *   captureSession.nativeVideoSource =
  *       RtcVideoFactory.createShmSource("/tmp/rtc-video", 720, 1280);
  *   captureSession.nativeVideoSource.start();
+ *   ...
+ *   RtcVideoFactory.stopShmSource(captureSession.nativeVideoSource);
+ *   captureSession.nativeVideoSource.stop();
  *
  * The width/height must match what the engine was started with (after
  * rotation): gst-shm transports raw bytes, both sides must agree on the
@@ -29,6 +32,10 @@ public:
     Q_INVOKABLE bool available() const;
     Q_INVOKABLE QObject *createShmSource(const QString &socketPath, int width,
                                          int height);
+    /* Stops a source from createShmSource before it is stopped or dropped
+     * (rtcShmReaderStop in rtcshmreader.h): call it first, then the
+     * source's stop(). The source cannot be started again. */
+    Q_INVOKABLE void stopShmSource(QObject *source);
 };
 
 #endif // RTCVIDEOFACTORY_H
