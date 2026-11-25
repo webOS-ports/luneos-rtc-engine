@@ -1,4 +1,4 @@
-// Copyright (c) 2026 LuneOS project
+// Copyright (c) 2026 Herman van Hazendonk <github.com@herrie.org>
 // SPDX-License-Identifier: Apache-2.0
 //
 // luneos-rtc-engine: real-time video media engine for calls on Halium
