@@ -1,4 +1,4 @@
-// Copyright (c) 2026 LuneOS project
+// Copyright (c) 2026 Herman van Hazendonk <github.com@herrie.org>
 // SPDX-License-Identifier: Apache-2.0
 //
 // Tearing down a live gst-shm reader the way Qt Multimedia 6.12 does

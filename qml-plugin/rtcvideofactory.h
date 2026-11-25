@@ -1,4 +1,4 @@
-// Copyright (c) 2026 LuneOS project
+// Copyright (c) 2026 Herman van Hazendonk <github.com@herrie.org>
 // SPDX-License-Identifier: Apache-2.0
 
 #ifndef RTCVIDEOFACTORY_H
